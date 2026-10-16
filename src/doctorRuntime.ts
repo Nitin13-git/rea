@@ -66,6 +66,19 @@ const inspectLinuxPrivateDisplay = async (
     environment,
   });
   const value = selection.diagnostic;
+  // A one-shot check has no later cleanup; retry once and report what stays owned.
+  const unstoppedProbes = selection.ok
+    ? 0
+    : (
+        await Promise.all(
+          selection.retainedProbes.map((probe) =>
+            probe.stop().then(
+              (stopped) => stopped.status === "incomplete",
+              () => true,
+            ),
+          ),
+        )
+      ).filter(Boolean).length;
   const detail = [
     `strategy=${selection.strategy}`,
     `socket_directory=${value.socket_directory}`,
@@ -74,6 +87,9 @@ const inspectLinuxPrivateDisplay = async (
     `effective_mode=${value.effective_socket_directory_mode ?? "unknown"}`,
     `effective_mount_read_only=${String(value.effective_mount_read_only)}`,
     `wsl=${String(value.wsl)}`,
+    ...(unstoppedProbes === 0
+      ? []
+      : [`unstopped_private_display_probes=${String(unstoppedProbes)}`]),
   ].join("; ");
   if (selection.ok)
     return {

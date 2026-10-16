@@ -13,6 +13,7 @@ import {
   ProviderProcessSupervisor,
   spawnOwnedProviderProcess,
   type ProviderProcessLaunch,
+  type ProviderProcessStopResult,
 } from "../process/ProviderProcess.js";
 import { parseLinuxPrivateDisplayDiagnostic } from "./LinuxPrivateDisplayDiagnostic.js";
 
@@ -28,12 +29,18 @@ export type LinuxPrivateDisplayRunnableStrategy = Exclude<
   "unavailable"
 >;
 
+/** An owned probe whose stop was not verified; stopping it again retries cleanup. */
+export interface RetainedLinuxPrivateDisplayProbe {
+  stop(): Promise<ProviderProcessStopResult>;
+}
+
 export interface LinuxPrivateDisplayProbeProcessResult {
   readonly outcome: "exited" | "timed-out" | "cancelled" | "launch-failed";
   readonly exitCode: number | null | undefined;
   readonly stderr: string;
   readonly stderrBytes: number;
-  readonly cleanupIncomplete: boolean;
+  /** Present only while the probe's owned process cleanup remains unverified. */
+  readonly retainedProbe?: RetainedLinuxPrivateDisplayProbe;
 }
 
 export type LinuxPrivateDisplayProbeRunner = (
@@ -57,6 +64,8 @@ export type LinuxPrivateDisplaySelection =
       readonly strategy: "unavailable";
       readonly exitCode: number;
       readonly diagnostic: HopperStartupFailureDiagnostic;
+      /** Probes still owned after failed cleanup; the caller must retry their stop. */
+      readonly retainedProbes: readonly RetainedLinuxPrivateDisplayProbe[];
     };
 
 /** Probe the exact Xvfb boundary and select the least-privileged viable strategy. */
@@ -72,7 +81,7 @@ export const selectLinuxPrivateDisplayStrategy = async (options: {
   const direct = await evaluatedProbe("direct", options, timeoutMs, runner);
   if (direct.ok) return direct;
   if (direct.diagnostic.failure_code !== "x11_socket_directory_unusable")
-    return unavailable(direct.diagnostic);
+    return unavailable(direct.diagnostic, direct.retainedProbes);
 
   const isolated = await evaluatedProbe(
     "user-mount-namespace",
@@ -81,16 +90,20 @@ export const selectLinuxPrivateDisplayStrategy = async (options: {
     runner,
   );
   if (!isolated.ok)
-    return unavailable({
-      ...direct.diagnostic,
-      strategy: "unavailable",
-      reason: "namespace_unavailable",
-      fallback_reason: isolated.diagnostic.reason,
-      effective_socket_directory_mode:
-        isolated.diagnostic.effective_socket_directory_mode,
-      effective_mount_read_only: isolated.diagnostic.effective_mount_read_only,
-      xvfb_stderr_bytes: isolated.diagnostic.xvfb_stderr_bytes,
-    });
+    return unavailable(
+      {
+        ...direct.diagnostic,
+        strategy: "unavailable",
+        reason: "namespace_unavailable",
+        fallback_reason: isolated.diagnostic.reason,
+        effective_socket_directory_mode:
+          isolated.diagnostic.effective_socket_directory_mode,
+        effective_mount_read_only:
+          isolated.diagnostic.effective_mount_read_only,
+        xvfb_stderr_bytes: isolated.diagnostic.xvfb_stderr_bytes,
+      },
+      [...direct.retainedProbes, ...isolated.retainedProbes],
+    );
   return {
     ok: true,
     strategy: "user-mount-namespace",
@@ -138,10 +151,10 @@ export const runLinuxPrivateDisplayProbe: LinuxPrivateDisplayProbeRunner =
       options.timeoutMs,
       options.signal,
     );
-    let cleanupIncomplete = false;
+    let retained = false;
     if (outcome !== "exit") {
       const stopped = await supervisor.stop();
-      cleanupIncomplete = stopped.status === "incomplete";
+      retained = stopped.status === "incomplete";
     } else supervisor.dispose();
     const snapshot = supervisor.snapshot();
     return {
@@ -154,7 +167,7 @@ export const runLinuxPrivateDisplayProbe: LinuxPrivateDisplayProbeRunner =
       exitCode: snapshot.exitCode,
       stderr: snapshot.stderr.text,
       stderrBytes: snapshot.stderr.bytes,
-      cleanupIncomplete,
+      ...(retained ? { retainedProbe: supervisor } : {}),
     };
   };
 
@@ -184,6 +197,23 @@ const privateDisplayProbeCommand = (
         ],
       };
 
+type ProbeVerdict =
+  | {
+      readonly ok: true;
+      readonly strategy: LinuxPrivateDisplayRunnableStrategy;
+      readonly diagnostic: HopperStartupReadyDiagnostic;
+    }
+  | {
+      readonly ok: false;
+      readonly diagnostic: HopperStartupFailureDiagnostic;
+    };
+
+type ProbeEvaluation =
+  | Extract<ProbeVerdict, { readonly ok: true }>
+  | (Extract<ProbeVerdict, { readonly ok: false }> & {
+      readonly retainedProbes: readonly RetainedLinuxPrivateDisplayProbe[];
+    });
+
 const evaluatedProbe = async (
   strategy: LinuxPrivateDisplayRunnableStrategy,
   options: {
@@ -193,17 +223,7 @@ const evaluatedProbe = async (
   },
   timeoutMs: number,
   runner: LinuxPrivateDisplayProbeRunner,
-): Promise<
-  | {
-      readonly ok: true;
-      readonly strategy: LinuxPrivateDisplayRunnableStrategy;
-      readonly diagnostic: HopperStartupReadyDiagnostic;
-    }
-  | {
-      readonly ok: false;
-      readonly diagnostic: HopperStartupFailureDiagnostic;
-    }
-> => {
+): Promise<ProbeEvaluation> => {
   let processResult: LinuxPrivateDisplayProbeProcessResult;
   try {
     processResult = await runner(strategy, {
@@ -220,8 +240,26 @@ const evaluatedProbe = async (
     return {
       ok: false,
       diagnostic: syntheticDiagnostic(strategy, "probe_failed"),
+      retainedProbes: [],
     };
   }
+  const verdict = evaluateProbeResult(strategy, processResult);
+  // Ownership of an unstopped probe outlives whatever diagnostic describes it.
+  return verdict.ok
+    ? verdict
+    : {
+        ...verdict,
+        retainedProbes:
+          processResult.retainedProbe === undefined
+            ? []
+            : [processResult.retainedProbe],
+      };
+};
+
+const evaluateProbeResult = (
+  strategy: LinuxPrivateDisplayRunnableStrategy,
+  processResult: LinuxPrivateDisplayProbeProcessResult,
+): ProbeVerdict => {
   if (processResult.outcome === "cancelled")
     return {
       ok: false,
@@ -236,11 +274,6 @@ const evaluatedProbe = async (
     return {
       ok: false,
       diagnostic: syntheticDiagnostic(strategy, "probe_failed"),
-    };
-  if (processResult.cleanupIncomplete)
-    return {
-      ok: false,
-      diagnostic: syntheticDiagnostic(strategy, "cleanup_incomplete"),
     };
   const parsed = parseLinuxPrivateDisplayDiagnostic(processResult.stderr);
   if (!parsed.ok)
@@ -294,11 +327,13 @@ const syntheticDiagnostic = (
 
 const unavailable = (
   diagnostic: HopperStartupFailureDiagnostic,
+  retainedProbes: readonly RetainedLinuxPrivateDisplayProbe[],
 ): LinuxPrivateDisplaySelection => ({
   ok: false,
   strategy: "unavailable",
   exitCode: hopperStartupExitCode(diagnostic.failure_code) ?? 70,
   diagnostic: { ...diagnostic, strategy: "unavailable" },
+  retainedProbes,
 });
 
 const emptyProcessResult = (
@@ -311,7 +346,6 @@ const emptyProcessResult = (
   exitCode: undefined,
   stderr: "",
   stderrBytes: 0,
-  cleanupIncomplete: false,
 });
 
 const waitForProbeOutputClose = async (

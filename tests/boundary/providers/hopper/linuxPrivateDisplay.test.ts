@@ -79,7 +79,6 @@ const processResult = (
   exitCode: value.status === "ready" ? 0 : failureExit(value.failure_code),
   stderr: `${LINUX_PRIVATE_DISPLAY_DIAGNOSTIC_PREFIX}${JSON.stringify(value)}\n`,
   stderrBytes: 0,
-  cleanupIncomplete: false,
   ...overrides,
 });
 
@@ -138,6 +137,43 @@ describe("Hopper process cleanup", () => {
       expect(result.status, result.stderr).toBe(0);
     },
   );
+});
+
+describe("Linux private display probe retention", () => {
+  it("hands every unstopped probe to the caller with the timeout reason intact", async () => {
+    const first = {
+      stop: () => Promise.resolve({ status: "killed" as const }),
+    };
+    const second = {
+      stop: () => Promise.resolve({ status: "killed" as const }),
+    };
+    const results = [
+      processResult(
+        diagnostic({
+          strategy: "direct",
+          status: "error",
+          failure_code: "x11_socket_directory_unusable",
+        }),
+        { retainedProbe: first },
+      ),
+      processResult(diagnostic({ strategy: "user-mount-namespace" }), {
+        outcome: "timed-out",
+        retainedProbe: second,
+      }),
+    ];
+    const runProbe: LinuxPrivateDisplayProbeRunner = () =>
+      Promise.resolve(results.shift() as LinuxPrivateDisplayProbeProcessResult);
+    const selection = await selectLinuxPrivateDisplayStrategy({
+      helperPath,
+      runProbe,
+    });
+    expect(selection).toMatchObject({
+      ok: false,
+      diagnostic: { fallback_reason: "probe_timeout" },
+    });
+    if (selection.ok) throw new Error("Expected unavailable selection");
+    expect(selection.retainedProbes).toEqual([first, second]);
+  });
 });
 
 describe("Linux private display selection", () => {
@@ -295,7 +331,6 @@ describe("private display probe output settlement", () => {
         exitCode: 0,
         stderr: "firstlast",
         stderrBytes: Buffer.byteLength("firstlast"),
-        cleanupIncomplete: false,
       });
     },
   );

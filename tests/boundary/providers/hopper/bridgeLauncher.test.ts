@@ -16,7 +16,10 @@ import {
   usesLinuxDemo,
 } from "../../../../src/hopper/BridgeLauncher.js";
 
-import { ProviderProcessSupervisor } from "../../../../src/process/ProviderProcess.js";
+import {
+  ProviderProcessSupervisor,
+  type ProviderProcessStopResult,
+} from "../../../../src/process/ProviderProcess.js";
 import { err, ok } from "../../../../src/domain/result.js";
 
 import { HopperReleaseError } from "../../../../src/application/HopperReleaseFeed.js";
@@ -407,3 +410,55 @@ it.skipIf(process.platform !== "linux")(
     expect(projected.details).not.toHaveProperty("launcher");
   },
 );
+
+it("retains an unstopped private-display probe through startup failure and retries its stop on close", async () => {
+  const stop = vi
+    .fn<() => Promise<ProviderProcessStopResult>>()
+    .mockResolvedValueOnce({ status: "incomplete", reason: "probe alive" })
+    .mockResolvedValueOnce({ status: "incomplete", reason: "probe alive" })
+    .mockResolvedValue({ status: "killed" });
+  const ready = await readyDirectDisplay();
+  const launcher = new HopperApplicationLauncher(options("/unused/Hopper"), {
+    selectPrivateDisplay: async () => ({
+      ok: false,
+      strategy: "unavailable",
+      exitCode: 70,
+      diagnostic: {
+        ...ready.diagnostic,
+        status: "error",
+        failure_code: "private_display_unavailable",
+        reason: "probe_timeout",
+        strategy: "unavailable",
+      },
+      retainedProbes: [{ stop }],
+    }),
+    retryPublisherCleanup: async () => undefined,
+    platform: "win32",
+  });
+  const client = new HopperClient({ launcher, startupTimeoutMs: 5_000 });
+  try {
+    expect(await client.start()).toMatchObject({
+      ok: false,
+      error: {
+        cleanupIncomplete: true,
+        cleanupResources: ["hopper-private-display-probe"],
+      },
+    });
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(await client.start()).toMatchObject({
+      ok: false,
+      error: { cleanupIncomplete: true },
+    });
+    expect(await client.close()).toMatchObject({
+      ok: false,
+      error: { cleanupResources: ["hopper-private-display-probe"] },
+    });
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(await client.close()).toEqual({ ok: true, value: null });
+    expect(stop).toHaveBeenCalledTimes(3);
+    expect(await client.close()).toEqual({ ok: true, value: null });
+    expect(stop).toHaveBeenCalledTimes(3);
+  } finally {
+    await client.close();
+  }
+});

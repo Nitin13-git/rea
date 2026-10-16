@@ -22,6 +22,7 @@ import {
   selectLinuxPrivateDisplayStrategy,
   type LinuxPrivateDisplayRunnableStrategy,
   type LinuxPrivateDisplaySelection,
+  type RetainedLinuxPrivateDisplayProbe,
 } from "./LinuxPrivateDisplayProbe.js";
 
 import {
@@ -103,6 +104,8 @@ interface SharedHopperApplicationLauncherOptions {
   };
 }
 
+const PRIVATE_DISPLAY_PROBE_RESOURCE = "hopper-private-display-probe";
+
 /** Explicit launcher contract; the Linux adapter verifies its pinned Hopper build before execution. */
 export type HopperApplicationLauncherOptions =
   | (SharedHopperApplicationLauncherOptions & {
@@ -148,7 +151,49 @@ export class HopperApplicationLauncher implements BridgeLauncher {
     readonly dependencies: HopperApplicationLauncherDependencies = {},
   ) {}
 
+  /** Private-display probes whose stop is unverified; each cleanup retries them. */
+  #retainedProbes: RetainedLinuxPrivateDisplayProbe[] = [];
+
   async cleanup(): Promise<Result<null, ProviderCleanupError>> {
+    const probes = await this.#retryRetainedProbes();
+    const publisher = await this.#retryPublisherCleanup();
+    if (probes === undefined) return publisher;
+    if (publisher.ok) return err(probes);
+    const reasons = [probes, publisher.error].map((error) => error.diagnostics);
+    return err(
+      new ProviderCleanupError(
+        "hopper",
+        [...probes.cleanupResources, ...publisher.error.cleanupResources],
+        { reason: reasons.map((value) => value?.reason).join("; ") },
+        { cause: publisher.error },
+      ),
+    );
+  }
+
+  async #retryRetainedProbes(): Promise<ProviderCleanupError | undefined> {
+    const reasons: string[] = [];
+    const remaining: RetainedLinuxPrivateDisplayProbe[] = [];
+    for (const probe of this.#retainedProbes) {
+      const stopped = await probe.stop().catch(
+        (cause: unknown) =>
+          ({
+            status: "incomplete",
+            reason: cause instanceof Error ? cause.message : String(cause),
+          }) as const,
+      );
+      if (stopped.status !== "incomplete") continue;
+      remaining.push(probe);
+      reasons.push(stopped.reason);
+    }
+    this.#retainedProbes = remaining;
+    return remaining.length === 0
+      ? undefined
+      : new ProviderCleanupError("hopper", [PRIVATE_DISPLAY_PROBE_RESOURCE], {
+          reason: reasons.join("; "),
+        });
+  }
+
+  async #retryPublisherCleanup(): Promise<Result<null, ProviderCleanupError>> {
     if (!usesLinuxDemo(this.options)) return ok(null);
     try {
       await (
@@ -435,6 +480,8 @@ export class HopperApplicationLauncher implements BridgeLauncher {
       environment: this.options.environment,
       ...(signal === undefined ? {} : { signal }),
     });
+    // Unstopped probes stay owned by this launcher even when startup fails.
+    if (!selection.ok) this.#retainedProbes.push(...selection.retainedProbes);
     if (signal?.aborted === true)
       return { ok: false, error: new HopperCancelledError() };
     return selection.ok
