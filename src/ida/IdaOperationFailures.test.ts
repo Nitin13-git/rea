@@ -13,6 +13,8 @@ import { createIdaDiagnosticRedactor } from "./IdaDiagnosticRedactor.js";
 import { decodeIdaToolResult } from "./IdaMcpConnection.js";
 import type { AnalysisOperation } from "../application/AnalysisProvider.js";
 import { IdaSessionClient } from "./IdaSessionClient.js";
+import { IDA_PROVIDER_IDENTITY } from "./IdaProviderCapabilities.js";
+import { createAnalysisProfile } from "../domain/analysisProfile.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -102,6 +104,62 @@ it("preserves a rejected headless decompile diagnostic with completed lookup evi
       code: "ENOENT",
     });
   }
+});
+
+describe("analysis profile on partial evidence", () => {
+  const run = async (profile?: ReturnType<typeof createAnalysisProfile>) => {
+    const { root, target } = await createIdaTarget();
+    roots.push(root);
+    const producer = new RecordingIdaMcp(target, "headless");
+    producer.beforeCall = async (name) => {
+      if (name === "decompile") throw new Error("Deliberate failure");
+    };
+    const client = new IdaSessionClient(
+      {
+        command: "fixture",
+        args: [],
+        env: {},
+        mode: "headless",
+        timeoutMs: 1000,
+        workspaceRoot: root,
+      },
+      target,
+      producer,
+      profile,
+    );
+    try {
+      const result = await client.execute("procedure_pseudo_code", {
+        procedure: "main",
+      });
+      if (result.ok) throw new Error("Expected the upstream failure");
+      return projectAnalysisError(result.error);
+    } finally {
+      expect((await client.close()).ok).toBe(true);
+    }
+  };
+
+  it("carries the resolved session profile and keeps target binding unverified", async () => {
+    const profile = createAnalysisProfile(IDA_PROVIDER_IDENTITY, {
+      mode: "headless",
+    });
+    expect(await run(profile)).toMatchObject({
+      details: {
+        partial_observation: {
+          analysis_profile: profile,
+          normalized_result: {
+            status: "partial",
+            target_binding: { status: "not_verified" },
+          },
+        },
+      },
+    });
+  });
+
+  it("keeps null when no profile was supplied", async () => {
+    expect(await run()).toMatchObject({
+      details: { partial_observation: { analysis_profile: null } },
+    });
+  });
 });
 
 describe("headless IDA tool diagnostics in partial evidence", () => {
